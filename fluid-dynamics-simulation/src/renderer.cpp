@@ -272,6 +272,23 @@ void Renderer::updateUI() {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
+#include "renderer.h"
+#include "shader.h"
+#include "texture.h"
+#include "particle_system.h"
+#include "fluid_simulation.h"
+#include "camera.h"
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <stdexcept>
+#include <iostream>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <stb_image.h>
+
+// ... [Previous code remains unchanged]
+
 void Renderer::render(const float* density, const float3* velocity, const float* temperature, const float* pressure, const float3* vorticity, const float3* color) {
     updateTextures(density, velocity, temperature, pressure, vorticity, color);
 
@@ -288,4 +305,164 @@ void Renderer::render(const float* density, const float3* velocity, const float*
     applyPostProcess();
 }
 
-void Renderer::updateTextures(const float* density, const float3* velocity, const float* temperature, const float* pressure, const float3
+void Renderer::updateTextures(const float* density, const float3* velocity, const float* temperature, const float* pressure, const float3* vorticity, const float3* color) {
+    textures[0]->updateData(density);
+    textures[1]->updateData(reinterpret_cast<const float*>(velocity));
+    textures[2]->updateData(temperature);
+    textures[3]->updateData(pressure);
+    textures[4]->updateData(reinterpret_cast<const float*>(vorticity));
+    textures[5]->updateData(reinterpret_cast<const float*>(color));
+}
+
+void Renderer::renderBackground() {
+    glDisable(GL_DEPTH_TEST);
+    postProcessShader->use();
+    postProcessShader->setInt("screenTexture", 0);
+    backgroundTexture->bind(0);
+
+    glBindVertexArray(VAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+}
+
+void Renderer::renderFluid() {
+    fluidShader->use();
+    for (size_t i = 0; i < textures.size(); ++i) {
+        fluidShader->setInt("texture" + std::to_string(i), i);
+        textures[i]->bind(i);
+    }
+    fluidShader->setFloat("time", glfwGetTime());
+    fluidShader->setVec2("resolution", glm::vec2(1280, 720));
+    fluidShader->setVec3("fluidColor", brushColor);
+    fluidShader->setFloat("viscosity", viscosity);
+    fluidShader->setFloat("diffusion", diffusion);
+
+    glBindVertexArray(VAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+}
+
+void Renderer::renderParticles() {
+    particleShader->use();
+    particleShader->setMat4("projection", camera.getProjectionMatrix());
+    particleShader->setMat4("view", camera.getViewMatrix());
+    particleSystem.render();
+}
+
+void Renderer::applyPostProcess() {
+    postProcessShader->use();
+    postProcessShader->setInt("screenTexture", 0);
+    postProcessShader->setFloat("time", glfwGetTime());
+    postProcessShader->setVec2("resolution", glm::vec2(1280, 720));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+
+    glBindVertexArray(VAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+}
+
+bool Renderer::shouldClose() const {
+    return glfwWindowShouldClose(window);
+}
+
+void Renderer::updateFPSCounter(float fps) {
+    std::string title = "Advanced Fluid Simulation - FPS: " + std::to_string(static_cast<int>(fps));
+    glfwSetWindowTitle(window, title.c_str());
+}
+
+bool Renderer::isKeyPressed(int key) const {
+    return glfwGetKey(window, key) == GLFW_PRESS;
+}
+
+glm::vec2 Renderer::getMousePosition() const {
+    double xpos, ypos;
+    glfwGetCursorPos(window, &xpos, &ypos);
+    return glm::vec2(xpos, ypos);
+}
+
+glm::vec2 Renderer::screenToSimulationSpace(double xpos, double ypos) {
+    int width, height;
+    glfwGetFramebufferSize(window, &width, &height);
+    return glm::vec2(xpos / width * N, (height - ypos) / height * N);
+}
+
+void Renderer::resetSimulation() {
+    fluidSimulation.reset();
+    particleSystem.reset();
+    camera = Camera(glm::vec3(0.0f, 0.0f, 3.0f));
+}
+
+void Renderer::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
+    auto* renderer = static_cast<Renderer*>(glfwGetWindowUserPointer(window));
+    glViewport(0, 0, width, height);
+    renderer->camera.setAspectRatio(static_cast<float>(width) / static_cast<float>(height));
+}
+
+void Renderer::keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    auto* renderer = static_cast<Renderer*>(glfwGetWindowUserPointer(window));
+
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+        glfwSetWindowShouldClose(window, true);
+    }
+}
+
+void Renderer::mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    auto* renderer = static_cast<Renderer*>(glfwGetWindowUserPointer(window));
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        if (action == GLFW_PRESS) {
+            renderer->isMousePressed = true;
+            double xpos, ypos;
+            glfwGetCursorPos(window, &xpos, &ypos);
+            renderer->lastMousePos = glm::vec2(xpos, ypos);
+        } else if (action == GLFW_RELEASE) {
+            renderer->isMousePressed = false;
+        }
+    } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+        if (action == GLFW_PRESS) {
+            renderer->isRightMousePressed = true;
+            double xpos, ypos;
+            glfwGetCursorPos(window, &xpos, &ypos);
+            renderer->lastMousePos = glm::vec2(xpos, ypos);
+        } else if (action == GLFW_RELEASE) {
+            renderer->isRightMousePressed = false;
+        }
+    }
+}
+
+void Renderer::cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
+    auto* renderer = static_cast<Renderer*>(glfwGetWindowUserPointer(window));
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
+    if (renderer->isMousePressed) {
+        glm::vec2 mousePos(xpos, ypos);
+        glm::vec2 mouseDelta = mousePos - renderer->lastMousePos;
+        glm::vec2 simPos = renderer->screenToSimulationSpace(xpos, ypos);
+        
+        glm::vec2 impulse = glm::normalize(mouseDelta) * renderer->impulseStrength;
+        renderer->fluidSimulation.addImpulse(simPos.x, simPos.y, impulse.x, impulse.y);
+        renderer->fluidSimulation.addColor(simPos.x, simPos.y, renderer->brushColor.r, renderer->brushColor.g, renderer->brushColor.b);
+        renderer->particleSystem.emitParticles(simPos.x, simPos.y, impulse.x, impulse.y);
+
+        renderer->lastMousePos = mousePos;
+    }
+
+    if (renderer->isRightMousePressed) {
+        float xoffset = xpos - renderer->lastMousePos.x;
+        float yoffset = renderer->lastMousePos.y - ypos;
+        renderer->camera.processMouseMovement(xoffset, yoffset);
+        renderer->lastMousePos = glm::vec2(xpos, ypos);
+    }
+}
+
+void Renderer::scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    auto* renderer = static_cast<Renderer*>(glfwGetWindowUserPointer(window));
+    renderer->camera.processMouseScroll(static_cast<float>(yoffset));
+}
